@@ -1,0 +1,13 @@
+version: '3.8'
+services:
+  oss-gateway:
+    build: .
+    image: 'harbor.qychat.tech/qaxim/oss-gateway:1'
+    container_name: wf-oss-gateway
+    ports:
+      - "8884:8884"
+    volumes:
+      - ./broker/config/wildfirechat.conf:/app/config/wildfirechat.conf
+
+volumes:
+  minio-data: 

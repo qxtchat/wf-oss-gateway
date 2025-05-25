@@ -1,0 +1,11 @@
+version: '3.8'
+services:
+  go-token-service:
+    build: .
+    image: 'harbor.qychat.tech/qaxim/go-token-service:1'
+    container_name: go-token-service
+    environment:
+      - MYSQL_DSN=root:root@tcp(mysql:3306)/wildfirechat?charset=utf8mb4&parseTime=True&loc=Local
+      - GO_TOKEN_SECRET=wfossgatewaydemo
+    ports:
+      - "2447:2447" 

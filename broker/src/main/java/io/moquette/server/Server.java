@@ -25,7 +25,6 @@ import io.moquette.server.config.*;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import win.liyufan.im.DBUtil;
 
 import java.io.File;
 import java.io.IOException;
@@ -39,7 +38,6 @@ public class Server {
         final IConfig config = defaultConfig();
 
         initMediaServerConfig(config);
-        DBUtil.init(config);
         UploadFileAction.USE_SM4 = Boolean.parseBoolean(config.getProperty("encrypt.use_sm4", "false"));
 
         int httpLocalPort = Integer.parseInt(config.getProperty(BrokerConstants.HTTP_LOCAL_PORT));

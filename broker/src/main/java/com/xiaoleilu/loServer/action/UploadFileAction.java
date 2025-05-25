@@ -14,6 +14,8 @@ import com.xiaoleilu.loServer.annotation.RequireAuthentication;
 import com.xiaoleilu.loServer.annotation.Route;
 import com.xiaoleilu.loServer.handler.*;
 import io.moquette.server.config.MediaServerConfig;
+import io.moquette.server.config.IConfig;
+import io.moquette.server.Server;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufInputStream;
 import io.netty.handler.codec.http.*;
@@ -22,7 +24,11 @@ import io.netty.util.internal.StringUtil;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import win.liyufan.im.DBUtil;
+import io.minio.MinioClient;
+import io.minio.PutObjectArgs;
+import io.minio.errors.MinioException;
+import io.minio.BucketExistsArgs;
+import io.minio.MakeBucketArgs;
 
 import javax.crypto.Cipher;
 import javax.crypto.CipherInputStream;
@@ -33,6 +39,10 @@ import java.io.*;
 import java.security.*;
 import java.util.Base64;
 import java.util.UUID;
+import javax.net.ssl.HttpsURLConnection;
+import java.net.URL;
+import java.net.URLEncoder;
+import java.security.MessageDigest;
 
 import static com.xiaoleilu.loServer.handler.HttpResponseHelper.getFileExt;
 
@@ -49,6 +59,42 @@ public class UploadFileAction extends Action {
     private String userSecret = null;
     private String fileName = null;
     private File saveFile = null;
+
+    // MinIO配置参数（建议从配置文件读取）
+    private static String MINIO_ENDPOINT = null;
+    private static String MINIO_ACCESS_KEY = null;
+    private static String MINIO_SECRET_KEY = null;
+    private static MinioClient minioClient = null;
+    private ByteArrayOutputStream minioBuffer = null;
+
+    private static String SECRET_KEY = null; // 从配置文件读取
+
+    static {
+        // minioClient = MinioClient.builder()
+        //     .endpoint(MINIO_ENDPOINT)
+        //     .credentials(MINIO_ACCESS_KEY, MINIO_SECRET_KEY)
+        //     .build();
+    }
+
+    private static void ensureMinioConfigLoaded() {
+        if (MINIO_ENDPOINT == null || MINIO_ACCESS_KEY == null || MINIO_SECRET_KEY == null) {
+            IConfig config = Server.defaultConfig();
+            MINIO_ENDPOINT = config.getProperty("minio.endpoint", "http://localhost:9000");
+            MINIO_ACCESS_KEY = config.getProperty("minio.access_key", "minioadmin");
+            MINIO_SECRET_KEY = config.getProperty("minio.secret_key", "minioadmin");
+            minioClient = MinioClient.builder()
+                .endpoint(MINIO_ENDPOINT)
+                .credentials(MINIO_ACCESS_KEY, MINIO_SECRET_KEY)
+                .build();
+        }
+    }
+
+    private static void ensureSecretKeyLoaded() {
+        if (SECRET_KEY == null) {
+            IConfig config = Server.defaultConfig();
+            SECRET_KEY = config.getProperty("go.token_secret", "wfossgatewaydemo");
+        }
+    }
 
     @Override
     public boolean action(Request r, Response response) {
@@ -243,6 +289,10 @@ public class UploadFileAction extends Action {
                         return false;
                     }
                 }
+            } else {
+                response.setStatus(HttpResponseStatus.BAD_REQUEST);
+                response.setContent("无效请求");
+                return false;
             }
         } catch (Exception e) {
             logger.error("writeHttpData error!", e);
@@ -255,45 +305,49 @@ public class UploadFileAction extends Action {
 
     //token已经校验，用户密钥已经取到，可以接收数据了
     public boolean beforeData() {
-        String dir = ServerSetting.getRootPath() + "/" + bucketName;
-
-        File dirFile = new File(dir);
-        boolean bFile  = dirFile.exists();
-
-        if(!bFile) {
-            bFile = dirFile.mkdirs();
-            if (!bFile) {
-                return false;
-            }
-        }
-
-        String filePath = dir + "/" + fileName;
-        logger.info("the file path is " + filePath);
-
-        saveFile = new File(filePath);
+        ensureMinioConfigLoaded();
+        minioBuffer = new ByteArrayOutputStream();
         return true;
     }
 
     //可以在这里进行文件上传，pos为收到文件内容的偏移量，data为收到解密过的数据，length为数据的长度， dataSize为总长度。
     public void onData(long pos, byte[] data, int length) throws Exception {
-        RandomAccessFile raf = null;
-        try {
-            raf = new RandomAccessFile(saveFile, "rwd");
-            raf.seek(pos);
-            raf.write(data, 0, length);
-        } finally {
-            try {
-                if (raf != null)
-                    raf.close();
-            } catch (Exception e) {
-                logger.warn("release error!", e);
-            }
-        }
+        minioBuffer.write(data, 0, length);
     }
 
     //已经完成所有数据的接收，如果想要修改返回客户端的Key值，在这个函数里修改fileName即可
     public void afterData() {
-        
+        ensureMinioConfigLoaded();
+        try {
+            // 检查bucket是否存在，不存在则创建
+            boolean exists = minioClient.bucketExists(BucketExistsArgs.builder().bucket(bucketName).build());
+            if (!exists) {
+                minioClient.makeBucket(MakeBucketArgs.builder().bucket(bucketName).build());
+                logger.info("MinIO bucket created: {}", bucketName);
+            }
+            byte[] fileBytes = minioBuffer.toByteArray();
+            ByteArrayInputStream bais = new ByteArrayInputStream(fileBytes);
+            minioClient.putObject(
+                PutObjectArgs.builder()
+                    .bucket(bucketName)
+                    .object(fileName)
+                    .stream(bais, fileBytes.length, -1)
+                    .contentType("application/octet-stream")
+                    .build()
+            );
+            logger.info("Upload to MinIO success: {}/{}", bucketName, fileName);
+        } catch (MinioException e) {
+            logger.error("MinIO upload error", e);
+            throw new RuntimeException("MinIO upload error: " + e.getMessage());
+        } catch (Exception e) {
+            logger.error("MinIO upload error", e);
+            throw new RuntimeException("MinIO upload error: " + e.getMessage());
+        } finally {
+            if (minioBuffer != null) {
+                try { minioBuffer.close(); } catch (Exception ignore) {}
+                minioBuffer = null;
+            }
+        }
     }
 
     //解密文件内容相关
@@ -366,14 +420,23 @@ public class UploadFileAction extends Action {
                 if(sId.equals(appid)) {
                     long ts = Long.parseLong(sts);
                     if((System.currentTimeMillis() - ts) < 180000) {
-                        String us = DBUtil.getUserSecret(ss[3], ss[2]);
-                        if(us != null) {
-                            bucketName = bucket;
-                            userSecret = us;
+                        String[] bucketParts = bucket.split("-");
+                        if (bucketParts.length > 1) {
+                            String ip = bucketParts[0];
+                            String userId = ss[3];
+                            String clientId = ss[2];
+                            String baseUrl = "https://" + ip + ":2448/getToken";
+                            String us = fetchSecretFromGoService(baseUrl, userId, clientId);
+                            if(us != null) {
+                                bucketName = bucket;
+                                userSecret = us;
+                            } else {
+                                System.out.println("get user secret failure");
+                            }
+                            return;
                         } else {
-                            System.out.println("get user secret failure");
+                            System.out.println("invalid bucket format");
                         }
-                        return;
                     } else {
                         System.out.println("time expired");
                     }
@@ -382,9 +445,56 @@ public class UploadFileAction extends Action {
                 }
             }
         } catch (Exception e) {
-            // TODO Auto-generated catch block
             e.printStackTrace();
         }
         return;
+    }
+
+    private String fetchSecretFromGoService(String baseUrl, String userId, String clientId) {
+        try {
+            ensureSecretKeyLoaded();
+            long timestamp = System.currentTimeMillis() / 1000;
+            String tsStr = String.valueOf(timestamp);
+            String sign = sha256(userId + clientId + tsStr + SECRET_KEY);
+            String urlStr = baseUrl + "?userId=" + URLEncoder.encode(userId, "UTF-8") +
+                    "&clientId=" + URLEncoder.encode(clientId, "UTF-8") +
+                    "&timestamp=" + tsStr +
+                    "&sign=" + sign;
+            URL url = new URL(urlStr);
+            HttpsURLConnection conn = (HttpsURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(3000);
+            conn.setReadTimeout(3000);
+            int code = conn.getResponseCode();
+            if (code == 200) {
+                try (BufferedReader in = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
+                    StringBuilder sb = new StringBuilder();
+                    String line;
+                    while ((line = in.readLine()) != null) {
+                        sb.append(line);
+                    }
+                    return sb.toString();
+                }
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return null;
+    }
+
+    private static String sha256(String str) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(str.getBytes("UTF-8"));
+            StringBuilder hexString = new StringBuilder();
+            for (byte b : hash) {
+                String hex = Integer.toHexString(0xff & b);
+                if(hex.length() == 1) hexString.append('0');
+                hexString.append(hex);
+            }
+            return hexString.toString();
+        } catch(Exception ex){
+            throw new RuntimeException(ex);
+        }
     }
 }
